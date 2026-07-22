@@ -398,116 +398,90 @@ function initUploader() {
   });
 
   // --- Real File Upload Handling (AJAX) ---
-  // --- Real Direct Cloud File Upload Handling ---
-  async function startRealUpload() {
+  // --- Real Firebase Cloud Upload Handling (AJAX) ---
+  function startRealUpload() {
     transitionToProgress();
 
-    const filesMeta = selectedFiles.map(f => ({
-      name: f.name,
-      size: f.size,
-      mime: f.type || 'application/octet-stream'
-    }));
+    const formData = new FormData();
+    selectedFiles.forEach(file => {
+      formData.append('files', file);
+    });
 
-    const initPayload = {
-      filesMeta,
-      activeTab,
-      senderEmail: senderEmailInput.value || '',
-      recipientEmails,
-      subject: document.getElementById('transfer-subject').value || '',
-      message: document.getElementById('transfer-message').value || '',
-      expiration: expirationSelect.value,
-      region: regionSelect.value,
-      password: (passwordToggle.checked && passwordInput.value) ? passwordInput.value : undefined
-    };
+    formData.append('activeTab', activeTab);
+    formData.append('senderEmail', senderEmailInput.value || '');
+    formData.append('recipientEmails', recipientEmails.join(','));
+    formData.append('subject', document.getElementById('transfer-subject').value || '');
+    formData.append('message', document.getElementById('transfer-message').value || '');
+    formData.append('expiration', expirationSelect.value);
+    formData.append('region', regionSelect.value);
 
-    try {
-      // Step 1: Initialize transfer and get signed upload URLs (Tiny JSON payload, 0 serverless overhead!)
-      const res = await fetch('/api/upload/init', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(initPayload)
-      });
+    if (passwordToggle.checked && passwordInput.value) {
+      formData.append('password', passwordInput.value);
+    }
 
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || 'Failed to initialize transfer');
-      }
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload', true);
 
-      const initData = await res.json();
-      const { hash, uploadItems } = initData;
+    const strokeMax = 351.85;
+    progressCircleFill.style.strokeDasharray = strokeMax;
 
-      const totalSize = selectedFiles.reduce((acc, f) => acc + f.size, 0);
-      const strokeMax = 351.85;
-      progressCircleFill.style.strokeDasharray = strokeMax;
+    let uploadStartTime = Date.now();
 
-      let uploadedBytesPerFile = new Array(selectedFiles.length).fill(0);
-      let uploadStartTime = Date.now();
-
-      function updateOverallProgress() {
-        const totalUploaded = uploadedBytesPerFile.reduce((acc, b) => acc + b, 0);
-        const progressPercent = Math.min(Math.round((totalUploaded / totalSize) * 100), 100);
-
+    xhr.upload.addEventListener('progress', (e) => {
+      if (e.lengthComputable) {
+        const progressPercent = Math.min(Math.round((e.loaded / e.total) * 100), 100);
+        
         const dashOffset = strokeMax - (progressPercent / 100) * strokeMax;
         progressCircleFill.style.strokeDashoffset = dashOffset;
         progressPercentageText.textContent = `${progressPercent}%`;
         progressLinearFill.style.width = `${progressPercent}%`;
 
-        progressUploadedSize.textContent = `${formatBytes(totalUploaded)} / ${formatBytes(totalSize)}`;
+        let fileAcc = 0;
+        let currentFileIndex = 0;
+        for (let i = 0; i < selectedFiles.length; i++) {
+          fileAcc += selectedFiles[i].size;
+          if (e.loaded <= fileAcc || i === selectedFiles.length - 1) {
+            currentFileIndex = i;
+            break;
+          }
+        }
+        progressCurrentFile.textContent = `Uploading [${currentFileIndex + 1}/${selectedFiles.length}]: ${selectedFiles[currentFileIndex].name}`;
+
+        progressUploadedSize.textContent = `${formatBytes(e.loaded)} / ${formatBytes(e.total)}`;
 
         const timeElapsed = (Date.now() - uploadStartTime) / 1000;
         if (timeElapsed > 0.1) {
-          const currentSpeed = totalUploaded / timeElapsed;
+          const currentSpeed = e.loaded / timeElapsed;
           progressSpeedText.textContent = `${(currentSpeed / (1024 * 1024)).toFixed(1)} MB/s`;
 
-          const remainingBytes = totalSize - totalUploaded;
-          const remainingSeconds = Math.ceil(remainingBytes / (currentSpeed || 1));
+          const remainingBytes = e.total - e.loaded;
+          const remainingSeconds = Math.ceil(remainingBytes / currentSpeed);
           progressTimeText.textContent = `Remaining: ${formatTime(remainingSeconds)}`;
         }
       }
+    });
 
-      // Step 2: Upload each file directly to Supabase Storage Bucket via Signed Upload URLs
-      for (let i = 0; i < selectedFiles.length; i++) {
-        const file = selectedFiles[i];
-        const item = uploadItems[i];
-
-        progressCurrentFile.textContent = `Uploading [${i + 1}/${selectedFiles.length}]: ${file.name}`;
-
-        await new Promise((resolve, reject) => {
-          const xhr = new XMLHttpRequest();
-          xhr.open('PUT', item.signedUrl, true);
-          xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
-
-          xhr.upload.addEventListener('progress', (e) => {
-            if (e.lengthComputable) {
-              uploadedBytesPerFile[i] = e.loaded;
-              updateOverallProgress();
-            }
-          });
-
-          xhr.onload = function() {
-            if (xhr.status >= 200 && xhr.status < 300) {
-              uploadedBytesPerFile[i] = file.size;
-              updateOverallProgress();
-              resolve();
-            } else {
-              reject(new Error(`Failed to upload ${file.name}: HTTP ${xhr.status}`));
-            }
-          };
-
-          xhr.onerror = function() {
-            reject(new Error(`Network error while uploading ${file.name}`));
-          };
-
-          xhr.send(file);
-        });
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        const response = JSON.parse(xhr.responseText);
+        finishUpload(response.hash);
+      } else {
+        try {
+          const errRes = JSON.parse(xhr.responseText);
+          alert(`Upload failed: ${errRes.error || 'Please check backend connection'}`);
+        } catch (e) {
+          alert('Upload failed. Please check backend connection.');
+        }
+        transitionToForm();
       }
+    };
 
-      finishUpload(hash);
-    } catch (err) {
-      console.error('Upload Error:', err);
-      alert(`Upload failed: ${err.message || 'Please check backend connection'}`);
+    xhr.onerror = function() {
+      alert('Network error occurred during upload.');
       transitionToForm();
-    }
+    };
+
+    xhr.send(formData);
   }
 
   function finishUpload(hash) {
