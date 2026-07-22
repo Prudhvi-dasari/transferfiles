@@ -9,7 +9,9 @@ import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
-import admin from 'firebase-admin';
+import { initializeApp, cert, getApps } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
+import { getStorage } from 'firebase-admin/storage';
 
 const archiver = archiverModule.default || archiverModule;
 const __filename = fileURLToPath(import.meta.url);
@@ -38,9 +40,9 @@ try {
   }
 
   if (projectId && clientEmail && privateKey && bucketName) {
-    if (!admin.apps.length) {
-      admin.initializeApp({
-        credential: admin.credential.cert({
+    if (getApps().length === 0) {
+      initializeApp({
+        credential: cert({
           projectId,
           clientEmail,
           privateKey
@@ -49,8 +51,8 @@ try {
       });
     }
 
-    db = admin.firestore();
-    bucket = admin.storage().bucket();
+    db = getFirestore();
+    bucket = getStorage().bucket();
     isFirebaseEnabled = true;
     console.log('[Firebase] Initialized Admin SDK, Firestore DB, and Firebase Storage successfully.');
   } else {
