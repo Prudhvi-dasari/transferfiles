@@ -298,6 +298,91 @@ function pushRealtimeEvent(uploader, eventData) {
 /* ==========================================================================
    Transfer Upload Endpoints (Buffered to RAM and pushed to Supabase Storage)
    ========================================================================== */
+/* Direct signed upload initialization (Zero Vercel serverless payload overhead!) */
+app.post('/api/upload/init', async (req, res) => {
+  if (!isSupabaseEnabled) {
+    return res.status(500).json({ error: 'Supabase integration is not configured.' });
+  }
+
+  const {
+    filesMeta = [],
+    senderEmail,
+    recipientEmails,
+    subject,
+    message,
+    password,
+    expiration = '24',
+    activeTab = 'link'
+  } = req.body;
+
+  if (!filesMeta || filesMeta.length === 0) {
+    return res.status(400).json({ error: 'No file metadata provided' });
+  }
+
+  const hash = crypto.randomBytes(3).toString('hex');
+  const expiryHours = parseInt(expiration);
+  const expiresAt = new Date(Date.now() + expiryHours * 60 * 60 * 1000).toISOString();
+
+  const filesList = [];
+  const uploadItems = [];
+
+  try {
+    for (let i = 0; i < filesMeta.length; i++) {
+      const fileMeta = filesMeta[i];
+      const storagePath = `transfers/${hash}/${fileMeta.name}`;
+
+      const { data, error } = await supabase.storage
+        .from(BUCKET_NAME)
+        .createSignedUploadUrl(storagePath);
+
+      if (error || !data || !data.signedUrl) {
+        throw error || new Error(`Could not generate signed upload URL for ${fileMeta.name}`);
+      }
+
+      filesList.push({
+        index: i,
+        name: fileMeta.name,
+        size: fileMeta.size,
+        mime: fileMeta.mime || 'application/octet-stream',
+        storagePath
+      });
+
+      uploadItems.push({
+        index: i,
+        name: fileMeta.name,
+        signedUrl: data.signedUrl,
+        token: data.token,
+        storagePath
+      });
+    }
+
+    const totalSize = filesList.reduce((acc, f) => acc + f.size, 0);
+    const uploader = req.cookies.session_user || null;
+
+    const transfer = {
+      hash,
+      activeTab,
+      senderEmail: senderEmail || 'Anonymous',
+      recipientEmails: Array.isArray(recipientEmails) ? recipientEmails : (recipientEmails ? recipientEmails.split(',').map(e => e.trim()) : []),
+      subject: subject || 'Shared files',
+      message: message || '',
+      passwordHash: password ? getSHA256(password) : null,
+      expiresAt,
+      createdAt: new Date().toISOString(),
+      files: filesList,
+      totalSize,
+      downloadsCount: 0,
+      uploader
+    };
+
+    await saveTransfer(transfer);
+    res.json({ success: true, hash, uploadItems });
+  } catch (err) {
+    console.error('[Supabase Storage] Init signed upload failed:', err);
+    res.status(500).json({ error: 'Failed to initialize direct cloud upload' });
+  }
+});
+
 app.post('/api/upload', upload.array('files'), async (req, res) => {
   if (!isSupabaseEnabled) {
     return res.status(500).json({ error: 'Supabase integration is not configured. Setup credentials in your .env file.' });
