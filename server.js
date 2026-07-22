@@ -659,7 +659,11 @@ if (fs.existsSync(distPath)) {
   });
 }
 
-// Start Server explicitly on host 0.0.0.0 (IPv4)
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Backend Express server is running on http://127.0.0.1:${PORT}`);
-});
+// Start Server explicitly on host 0.0.0.0 (IPv4) if not running on Vercel
+if (!process.env.VERCEL) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Backend Express server is running on http://127.0.0.1:${PORT}`);
+  });
+}
+
+export default app;
