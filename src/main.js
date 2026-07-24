@@ -1,3 +1,8 @@
+import { auth, db, storage } from './firebase.js';
+import { onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, updateProfile } from 'firebase/auth';
+import { collection, addDoc, getDocs, query, where, doc, getDoc, setDoc, deleteDoc } from 'firebase/firestore';
+import { ref, uploadBytesResumable, getDownloadURL, deleteObject } from 'firebase/storage';
+
 // TransferNow Clone Interactive Scripting Engine
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -22,26 +27,22 @@ function checkAuthNavbar() {
 
   if (!navActions) return;
 
-  fetch('/api/auth/me')
-    .then(res => {
-      if (res.ok) return res.json();
-      throw new Error('Not logged in');
-    })
-    .then(user => {
+  onAuthStateChanged(auth, (user) => {
+    if (user) {
       // User is logged in
+      const displayName = user.displayName || user.email.split('@')[0];
       navActions.innerHTML = `
-        <a href="/dashboard.html" class="btn btn-outline" style="padding: 8px 20px; margin-right: 8px;">Dashboard (${user.username})</a>
+        <a href="/dashboard.html" class="btn btn-outline" style="padding: 8px 20px; margin-right: 8px;">Dashboard (${displayName})</a>
         <button id="nav-logout-btn" class="btn btn-primary" style="padding: 8px 20px;">Log out</button>
       `;
 
       document.getElementById('nav-logout-btn')?.addEventListener('click', () => {
-        fetch('/api/auth/logout', { method: 'POST' })
-          .then(() => window.location.href = '/index.html');
+        signOut(auth).then(() => {
+          window.location.href = '/index.html';
+        });
       });
-    })
-    .catch(() => {
-      // Not logged in, keep default login/signup buttons
-    });
+    }
+  });
 }
 
 /* ==========================================================================
@@ -399,89 +400,97 @@ function initUploader() {
 
   // --- Real File Upload Handling (AJAX) ---
   // --- Real Firebase Cloud Upload Handling (AJAX) ---
-  function startRealUpload() {
+  async function startRealUpload() {
     transitionToProgress();
 
-    const formData = new FormData();
-    selectedFiles.forEach(file => {
-      formData.append('files', file);
-    });
-
-    formData.append('activeTab', activeTab);
-    formData.append('senderEmail', senderEmailInput.value || '');
-    formData.append('recipientEmails', recipientEmails.join(','));
-    formData.append('subject', document.getElementById('transfer-subject').value || '');
-    formData.append('message', document.getElementById('transfer-message').value || '');
-    formData.append('expiration', expirationSelect.value);
-    formData.append('region', regionSelect.value);
+    // 1. Generate unique hash
+    const hash = Array.from({length: 16}, () => Math.floor(Math.random() * 16).toString(16)).join('');
+    
+    // 2. Prepare Metadata
+    const transferDoc = {
+      hash,
+      activeTab,
+      senderEmail: senderEmailInput.value || '',
+      recipientEmails,
+      subject: document.getElementById('transfer-subject').value || '',
+      message: document.getElementById('transfer-message').value || '',
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + parseInt(expirationSelect.value) * 24 * 60 * 60 * 1000).toISOString(),
+      region: regionSelect.value,
+      files: selectedFiles.map(f => ({ name: f.name, size: f.size, type: f.type }))
+    };
 
     if (passwordToggle.checked && passwordInput.value) {
-      formData.append('password', passwordInput.value);
+      // Basic client-side hashing (Note: For a production app, do this securely)
+      const encoder = new TextEncoder();
+      const data = encoder.encode(passwordInput.value);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      transferDoc.passwordHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
     }
-
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/upload', true);
+    
+    // Add user ID if logged in
+    if (auth.currentUser) {
+      transferDoc.userId = auth.currentUser.uid;
+    }
 
     const strokeMax = 351.85;
     progressCircleFill.style.strokeDasharray = strokeMax;
 
     let uploadStartTime = Date.now();
+    let totalBytes = selectedFiles.reduce((acc, f) => acc + f.size, 0);
+    let loadedBytes = 0;
+    let fileProgress = selectedFiles.map(() => 0);
 
-    xhr.upload.addEventListener('progress', (e) => {
-      if (e.lengthComputable) {
-        const progressPercent = Math.min(Math.round((e.loaded / e.total) * 100), 100);
+    try {
+      // 3. Upload files sequentially to Firebase Storage
+      for (let i = 0; i < selectedFiles.length; i++) {
+        const file = selectedFiles[i];
+        progressCurrentFile.textContent = `Uploading [${i + 1}/${selectedFiles.length}]: ${file.name}`;
         
-        const dashOffset = strokeMax - (progressPercent / 100) * strokeMax;
-        progressCircleFill.style.strokeDashoffset = dashOffset;
-        progressPercentageText.textContent = `${progressPercent}%`;
-        progressLinearFill.style.width = `${progressPercent}%`;
+        const storageRef = ref(storage, `transfers/${hash}/${file.name}`);
+        const uploadTask = uploadBytesResumable(storageRef, file);
 
-        let fileAcc = 0;
-        let currentFileIndex = 0;
-        for (let i = 0; i < selectedFiles.length; i++) {
-          fileAcc += selectedFiles[i].size;
-          if (e.loaded <= fileAcc || i === selectedFiles.length - 1) {
-            currentFileIndex = i;
-            break;
-          }
-        }
-        progressCurrentFile.textContent = `Uploading [${currentFileIndex + 1}/${selectedFiles.length}]: ${selectedFiles[currentFileIndex].name}`;
+        await new Promise((resolve, reject) => {
+          uploadTask.on('state_changed', 
+            (snapshot) => {
+              fileProgress[i] = snapshot.bytesTransferred;
+              loadedBytes = fileProgress.reduce((a, b) => a + b, 0);
+              
+              const progressPercent = Math.min(Math.round((loadedBytes / totalBytes) * 100), 100);
+              const dashOffset = strokeMax - (progressPercent / 100) * strokeMax;
+              progressCircleFill.style.strokeDashoffset = dashOffset;
+              progressPercentageText.textContent = `${progressPercent}%`;
+              progressLinearFill.style.width = `${progressPercent}%`;
+              progressUploadedSize.textContent = `${formatBytes(loadedBytes)} / ${formatBytes(totalBytes)}`;
 
-        progressUploadedSize.textContent = `${formatBytes(e.loaded)} / ${formatBytes(e.total)}`;
+              const timeElapsed = (Date.now() - uploadStartTime) / 1000;
+              if (timeElapsed > 0.1) {
+                const currentSpeed = loadedBytes / timeElapsed;
+                progressSpeedText.textContent = `${(currentSpeed / (1024 * 1024)).toFixed(1)} MB/s`;
 
-        const timeElapsed = (Date.now() - uploadStartTime) / 1000;
-        if (timeElapsed > 0.1) {
-          const currentSpeed = e.loaded / timeElapsed;
-          progressSpeedText.textContent = `${(currentSpeed / (1024 * 1024)).toFixed(1)} MB/s`;
-
-          const remainingBytes = e.total - e.loaded;
-          const remainingSeconds = Math.ceil(remainingBytes / currentSpeed);
-          progressTimeText.textContent = `Remaining: ${formatTime(remainingSeconds)}`;
-        }
+                const remainingBytes = totalBytes - loadedBytes;
+                const remainingSeconds = Math.ceil(remainingBytes / currentSpeed);
+                progressTimeText.textContent = `Remaining: ${formatTime(remainingSeconds)}`;
+              }
+            }, 
+            (error) => reject(error), 
+            () => resolve()
+          );
+        });
       }
-    });
 
-    xhr.onload = function() {
-      if (xhr.status === 200) {
-        const response = JSON.parse(xhr.responseText);
-        finishUpload(response.hash);
-      } else {
-        try {
-          const errRes = JSON.parse(xhr.responseText);
-          alert(`Upload failed: ${errRes.error || 'Please check backend connection'}`);
-        } catch (e) {
-          alert('Upload failed. Please check backend connection.');
-        }
-        transitionToForm();
-      }
-    };
+      // 4. Save metadata to Firestore using the hash as the Document ID
+      await setDoc(doc(db, 'transfers', hash), transferDoc);
+      
+      // 5. Complete
+      finishUpload(hash);
 
-    xhr.onerror = function() {
-      alert('Network error occurred during upload.');
+    } catch (err) {
+      console.error(err);
+      alert('Upload failed: ' + err.message);
       transitionToForm();
-    };
-
-    xhr.send(formData);
+    }
   }
 
   function finishUpload(hash) {
@@ -652,25 +661,19 @@ function initAuthPages() {
   if (loginForm) {
     loginForm.addEventListener('submit', (e) => {
       e.preventDefault();
-      const username = document.getElementById('login-username').value.trim();
+      // login-username input now expects an email in this serverless flow
+      const email = document.getElementById('login-username').value.trim();
       const password = document.getElementById('login-password').value;
       const errorMsg = document.getElementById('login-error-msg');
 
       errorMsg.style.display = 'none';
 
-      fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password })
-      })
-      .then(res => {
-        if (res.ok) return res.json();
-        throw new Error('Login failed');
-      })
+      signInWithEmailAndPassword(auth, email, password)
       .then(() => {
         window.location.href = '/dashboard.html';
       })
-      .catch(() => {
+      .catch((err) => {
+        errorMsg.textContent = 'Login failed: ' + err.message;
         errorMsg.style.display = 'block';
       });
     });
@@ -699,20 +702,15 @@ function initAuthPages() {
         return;
       }
 
-      fetch('/api/auth/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, email, password })
-      })
-      .then(res => {
-        if (res.ok) return res.json();
-        return res.json().then(data => { throw new Error(data.error || 'Register failed') });
+      createUserWithEmailAndPassword(auth, email, password)
+      .then((userCredential) => {
+        return updateProfile(userCredential.user, { displayName: username });
       })
       .then(() => {
         window.location.href = '/dashboard.html';
       })
       .catch((err) => {
-        errorMsg.textContent = err.message;
+        errorMsg.textContent = 'Registration failed: ' + err.message;
         errorMsg.style.display = 'block';
       });
     });
@@ -735,38 +733,42 @@ function initDashboard() {
 
   let transfersData = [];
 
-  // 1. Verify Auth and fetch info
-  fetch('/api/auth/me')
-    .then(res => {
-      if (res.ok) return res.json();
-      throw new Error('Unauthorized');
-    })
-    .then(user => {
-      titleHeader.textContent = `Welcome back, ${user.username}!`;
-      loadTransfersList();
-      initSSEListener();
-    })
-    .catch(() => {
+  onAuthStateChanged(auth, (user) => {
+    if (user) {
+      const displayName = user.displayName || user.email.split('@')[0];
+      titleHeader.textContent = `Welcome back, ${displayName}!`;
+      loadTransfersList(user.uid);
+    } else {
       window.location.href = '/login.html';
-    });
-
-  // Logout listener
-  btnLogout?.addEventListener('click', () => {
-    fetch('/api/auth/logout', { method: 'POST' })
-      .then(() => window.location.href = '/index.html');
+    }
   });
 
-  function loadTransfersList() {
-    fetch('/api/user/transfers')
-      .then(res => res.json())
-      .then(data => {
-        transfersData = data.transfers || [];
-        renderTransfersTable(transfersData);
-        calculateDashboardMetrics(transfersData);
-      })
-      .catch(err => {
-        tableBody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding: 40px; color:var(--danger);">Error fetching transfers.</td></tr>`;
+  btnLogout?.addEventListener('click', () => {
+    signOut(auth).then(() => window.location.href = '/index.html');
+  });
+
+  async function loadTransfersList(uid) {
+    try {
+      const q = query(collection(db, 'transfers'), where('userId', '==', uid));
+      const querySnapshot = await getDocs(q);
+      
+      transfersData = [];
+      querySnapshot.forEach((docSnap) => {
+        const t = docSnap.data();
+        transfersData.push({
+          ...t,
+          filesCount: t.files ? t.files.length : 0,
+          totalSize: t.files ? t.files.reduce((a,f) => a + f.size, 0) : 0,
+          downloadsCount: t.downloadsCount || 0
+        });
       });
+      
+      renderTransfersTable(transfersData);
+      calculateDashboardMetrics(transfersData);
+    } catch (err) {
+      console.error(err);
+      tableBody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding: 40px; color:var(--danger);">Error fetching transfers.</td></tr>`;
+    }
   }
 
   function calculateDashboardMetrics(transfers) {
@@ -790,8 +792,8 @@ function initDashboard() {
       const isExpired = new Date() > new Date(t.expiresAt);
       const row = document.createElement('tr');
       row.innerHTML = `
-        <td style="font-weight: 600;">${t.subject}</td>
-        <td>${t.filesCount} file${t.filesCount > 1 ? 's' : ''}</td>
+        <td style="font-weight: 600;">${t.subject || 'Untitled'}</td>
+        <td>${t.filesCount} file${t.filesCount !== 1 ? 's' : ''}</td>
         <td>${formatBytes(t.totalSize)}</td>
         <td>${t.downloadsCount} times</td>
         <td>
@@ -800,7 +802,7 @@ function initDashboard() {
           </span>
         </td>
         <td>
-          ${t.passwordProtected 
+          ${t.passwordHash 
             ? `<span title="Password Protected" style="color:var(--primary); cursor:pointer;"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>`
             : `<span style="color:var(--dark-light); font-size:12px;">Open</span>`}
         </td>
@@ -816,7 +818,6 @@ function initDashboard() {
       tableBody.appendChild(row);
     });
 
-    // Wire buttons
     tableBody.querySelectorAll('.btn-copy-transfer').forEach(btn => {
       btn.addEventListener('click', () => {
         const hash = btn.getAttribute('data-hash');
@@ -828,66 +829,43 @@ function initDashboard() {
     });
 
     tableBody.querySelectorAll('.btn-delete').forEach(btn => {
-      btn.addEventListener('click', () => {
+      btn.addEventListener('click', async () => {
         const hash = btn.getAttribute('data-hash');
         if (confirm('Are you sure you want to permanently delete this file transfer and purge all files from disk?')) {
-          fetch(`/api/transfer/${hash}`, { method: 'DELETE' })
-            .then(res => {
-              if (res.ok) {
-                loadTransfersList();
-                showLiveToast('Transfer deleted and files purged.');
-              } else {
-                alert('Revocation failed.');
+          try {
+            // Delete metadata
+            await deleteDoc(doc(db, 'transfers', hash));
+            
+            // Note: Cloud Storage folder deletion should ideally be done by a Cloud Function 
+            // since Web SDK can't delete folders. We can delete individual files since we know their names.
+            const t = transfersData.find(tr => tr.hash === hash);
+            if (t && t.files) {
+              for (const f of t.files) {
+                const fileRef = ref(storage, `transfers/${hash}/${f.name}`);
+                deleteObject(fileRef).catch(e => console.log('File may already be deleted'));
               }
-            });
+            }
+            
+            showLiveToast('Transfer deleted and files purged.');
+            loadTransfersList(auth.currentUser.uid);
+          } catch (e) {
+            alert('Revocation failed.');
+          }
         }
       });
     });
   }
 
-  // Search filter
   searchInput?.addEventListener('input', () => {
     const query = searchInput.value.toLowerCase().trim();
     const filtered = transfersData.filter(t => 
-      t.subject.toLowerCase().includes(query) || 
+      (t.subject && t.subject.toLowerCase().includes(query)) || 
       t.hash.toLowerCase().includes(query)
     );
     renderTransfersTable(filtered);
   });
 
-  // 2. Server-Sent Events Realtime streaming alerts
-  function initSSEListener() {
-    const logList = document.getElementById('realtime-log-list');
-    const placeholder = document.getElementById('realtime-log-placeholder');
-
-    const eventSource = new EventSource('/api/realtime/stream');
-
-    eventSource.onmessage = function(event) {
-      const data = JSON.parse(event.data);
-      if (data.type === 'download') {
-        if (placeholder) placeholder.style.display = 'none';
-
-        // Add to live log feeds
-        const li = document.createElement('li');
-        li.className = 'realtime-log-item';
-        li.innerHTML = `
-          <span>Recipient downloaded <strong>${data.filename}</strong> (IP: ${data.ip}) from transfer <strong>"${data.subject}"</strong></span>
-          <span class="realtime-log-time">${new Date(data.timestamp).toLocaleTimeString()}</span>
-        `;
-        logList.insertBefore(li, logList.firstChild);
-
-        // Display a slide-in bottom toast alert
-        showLiveToast(`Recipient downloaded "${data.filename}" just now!`);
-        
-        // Refresh the transfers dashboard metrics to increment downloads count dynamically
-        loadTransfersList();
-      }
-    };
-
-    eventSource.onerror = function() {
-      console.log('SSE connection closed or re-connecting...');
-    };
-  }
+  // SSE Listener removed for serverless deployment
 
   function showLiveToast(message) {
     const container = document.getElementById('live-toast-container');
@@ -945,25 +923,30 @@ function initDownloadPortal() {
     return;
   }
 
-  // Load Transfer Metadata
-  fetch(`/api/transfer/${hash}`)
-    .then(res => {
-      if (res.ok) return res.json();
-      if (res.status === 404) throw new Error('This transfer does not exist, has expired, or was deleted.');
-      throw new Error('Connection error fetching transfer details.');
-    })
-    .then(transfer => {
-      // Check if password lock active
-      if (transfer.passwordRequired) {
+  async function loadTransfer() {
+    try {
+      const docSnap = await getDoc(doc(db, 'transfers', hash));
+      if (!docSnap.exists()) {
+        throw new Error('This transfer does not exist, has expired, or was deleted.');
+      }
+      const transfer = docSnap.data();
+      
+      if (new Date() > new Date(transfer.expiresAt)) {
+        throw new Error('This transfer has expired.');
+      }
+
+      if (transfer.passwordHash) {
         passGateway.style.display = 'block';
         initPasswordUnlock(transfer);
       } else {
         renderTransferDetails(transfer);
       }
-    })
-    .catch(err => {
+    } catch (err) {
       showErrorCard(err.message);
-    });
+    }
+  }
+
+  loadTransfer();
 
   function showErrorCard(msg) {
     passGateway.style.display = 'none';
@@ -973,67 +956,82 @@ function initDownloadPortal() {
   }
 
   function initPasswordUnlock(transfer) {
-    unlockForm.addEventListener('submit', (e) => {
+    unlockForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       unlockError.style.display = 'none';
 
-      fetch(`/api/transfer/${hash}/unlock`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: unlockPassInput.value })
-      })
-      .then(res => {
-        if (res.ok) return res.json();
-        throw new Error('Incorrect password');
-      })
-      .then(data => {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(unlockPassInput.value);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const inputHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+      if (inputHash === transfer.passwordHash) {
         passGateway.style.display = 'none';
-        // Merge verification payload into metadata
-        transfer.files = data.files;
         renderTransferDetails(transfer);
-      })
-      .catch(() => {
+      } else {
         unlockError.style.display = 'block';
-      });
+      }
     });
   }
 
   function renderTransferDetails(transfer) {
     mainBox.style.display = 'block';
-    subjectEl.textContent = transfer.subject;
+    subjectEl.textContent = transfer.subject || 'Untitled';
     senderEl.textContent = transfer.senderEmail;
     expiryEl.textContent = new Date(transfer.expiresAt).toLocaleDateString() + ' ' + new Date(transfer.expiresAt).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
     
     const count = transfer.files.length;
-    countEl.textContent = `${count} file${count > 1 ? 's' : ''}`;
-    sizeEl.textContent = formatBytes(transfer.totalSize);
+    const totalSize = transfer.files.reduce((a,f) => a + f.size, 0);
+    countEl.textContent = `${count} file${count !== 1 ? 's' : ''}`;
+    sizeEl.textContent = formatBytes(totalSize);
 
     if (transfer.message) {
       messageWrap.style.display = 'block';
       messageEl.textContent = transfer.message;
     }
 
-    filesCountBadge.textContent = `${count} file${count > 1 ? 's' : ''}`;
+    filesCountBadge.textContent = `${count} file${count !== 1 ? 's' : ''}`;
 
     // Populate files rows
     filesListEl.innerHTML = '';
     transfer.files.forEach(f => {
       const li = document.createElement('li');
       li.className = 'download-file-row';
+      
+      const fileRef = ref(storage, `transfers/${hash}/${f.name}`);
+      const btnId = `btn-download-${f.name.replace(/[^a-zA-Z0-9]/g, '')}`;
+
       li.innerHTML = `
         <span class="download-file-name" title="${f.name}">${f.name}</span>
         <span style="color:var(--dark-light);">${formatBytes(f.size)}</span>
-        <a href="/api/transfer/${hash}/file/${f.index}" class="action-btn-circle" title="Download File">
+        <a id="${btnId}" href="#" class="action-btn-circle" title="Download File">
           <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
         </a>
       `;
       filesListEl.appendChild(li);
+
+      // Bind download link dynamically
+      document.getElementById(btnId).addEventListener('click', async (e) => {
+        e.preventDefault();
+        try {
+          const url = await getDownloadURL(fileRef);
+          
+          // Increment download count in Firestore
+          setDoc(doc(db, 'transfers', hash), {
+            downloadsCount: (transfer.downloadsCount || 0) + 1
+          }, { merge: true });
+
+          // Open URL to download
+          window.open(url, '_blank');
+        } catch (err) {
+          alert('Could not download file. It may have been deleted.');
+        }
+      });
     });
 
-    // Bulk ZIP link
-    btnDownloadZip.addEventListener('click', () => {
-      window.location.href = `/api/transfer/${hash}/zip`;
-    });
+    // Hide bulk ZIP link for serverless version
+    btnDownloadZip.style.display = 'none';
   }
 }
 
